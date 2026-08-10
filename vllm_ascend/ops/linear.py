@@ -75,10 +75,24 @@ direct_register_custom_op(
 )
 
 
+_MATMUL_REPLACE_LINEAR_ATTR = "layout_matmul_replace_linear"
+_MATMUL_WEIGHT_KN_READY_ATTR = "_layout_matmul_weight_kn_ready"
+
+
 class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
     """Linear method without quantization"""
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Some NPU shapes are faster when torch.matmul consumes a resident
+        # contiguous [K, N] weight instead of F.linear consuming [N, K] with
+        # transB. The model opts individual layers into this layout before the
+        # generic post-load processing walk reaches them.
+        if getattr(layer, _MATMUL_REPLACE_LINEAR_ATTR, False) is True:
+            if getattr(layer, _MATMUL_WEIGHT_KN_READY_ATTR, False) is not True:
+                layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+                setattr(layer, _MATMUL_WEIGHT_KN_READY_ATTR, True)
+            return
+
         super().process_weights_after_loading(layer)
         # must use fp32 to avoid accuracy degradation in dsv4.
         if getattr(layer, "precast_fp32_weight", False):
@@ -92,6 +106,11 @@ class AscendUnquantizedLinearMethod(UnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, _MATMUL_WEIGHT_KN_READY_ATTR, False) is True:
+            output = torch.matmul(x, layer.weight)
+            if bias is not None:
+                output = output + bias
+            return output
         return torch.ops.vllm.unquantized_gemm(x, layer.weight, bias)
 
 

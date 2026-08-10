@@ -88,6 +88,27 @@ class TestAscendUnquantizedLinearMethod(TestBase):
         self.method.process_weights_after_loading(self.layer)
         mock_format_cast.assert_called_once()
 
+    @mock.patch("torch_npu.npu_format_cast")
+    def test_matmul_layout_transposes_once_and_matches_linear(self, mock_format_cast):
+        layer = torch.nn.Module()
+        original_weight = torch.randn(12, 5)
+        bias = torch.randn(12)
+        layer.weight = torch.nn.Parameter(original_weight.clone())
+        layer.layout_matmul_replace_linear = True
+
+        inputs = torch.randn(3, 5)
+        expected = torch.nn.functional.linear(inputs, original_weight, bias)
+
+        self.method.process_weights_after_loading(layer)
+        self.method.process_weights_after_loading(layer)
+        actual = self.method.apply(layer, inputs, bias)
+
+        self.assertEqual(layer.weight.shape, (5, 12))
+        self.assertTrue(layer.weight.is_contiguous())
+        self.assertTrue(layer._layout_matmul_weight_kn_ready)
+        mock_format_cast.assert_not_called()
+        torch.testing.assert_close(actual, expected)
+
 
 class TestAscendRowParallelLinear(BaseLinearTest):
     @patch("vllm_ascend.ops.linear_op.get_weight_prefetch_method", return_value=MagicMock())
