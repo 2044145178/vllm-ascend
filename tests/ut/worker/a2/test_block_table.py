@@ -86,6 +86,42 @@ class TestBlockTableComputeSlotMapping(TestBase):
             block_ids = list(range(i * 4, (i + 1) * 4))  # [0,1,2,3], [4,5,6,7], etc.
             block_table.add_row(block_ids, i)
 
+    def test_single_request_single_token_uses_decode_fast_path(self):
+        block_table = self.create_block_table(1, 0, 1, 0, 1)
+        self.setup_block_table_data(block_table, num_reqs=1)
+
+        with (
+            patch("vllm_ascend.worker.block_table._compute_single_token_slot_mapping_kernel") as single_kernel,
+            patch("vllm_ascend.worker.block_table._compute_slot_mapping_kernel") as generic_kernel,
+        ):
+            block_table.compute_slot_mapping(
+                1,
+                torch.tensor([0, 1], dtype=torch.int32),
+                torch.tensor([129], dtype=torch.int64),
+            )
+
+        single_kernel.__getitem__.assert_called_once_with((1,))
+        single_kernel.__getitem__.return_value.assert_called_once()
+        generic_kernel.__getitem__.assert_not_called()
+
+    def test_multiple_tokens_keep_generic_slot_mapping_path(self):
+        block_table = self.create_block_table(1, 0, 1, 0, 1)
+        self.setup_block_table_data(block_table, num_reqs=1)
+
+        with (
+            patch("vllm_ascend.worker.block_table._compute_single_token_slot_mapping_kernel") as single_kernel,
+            patch("vllm_ascend.worker.block_table._compute_slot_mapping_kernel") as generic_kernel,
+        ):
+            block_table.compute_slot_mapping(
+                1,
+                torch.tensor([0, 2], dtype=torch.int32),
+                torch.tensor([128, 129], dtype=torch.int64),
+            )
+
+        single_kernel.__getitem__.assert_not_called()
+        generic_kernel.__getitem__.assert_called_once_with((2,))
+        generic_kernel.__getitem__.return_value.assert_called_once()
+
     def _test_slot_mapping_for_ranks(self, dcp_world_size, pcp_world_size, cp_kv_cache_interleave_size, test_configs):
         """Helper method to test slot_mapping across multiple ranks
 

@@ -1,5 +1,7 @@
 import numpy as np
 import torch
+import triton
+import triton.language as tl
 from vllm.distributed import get_dcp_group, get_pcp_group
 from vllm.utils.math_utils import cdiv
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -9,6 +11,28 @@ from vllm.v1.worker.block_table import _compute_slot_mapping_kernel
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 from vllm_ascend.utils import vllm_version_is
+
+
+@triton.jit
+def _compute_single_token_slot_mapping_kernel(
+    positions_ptr,
+    block_table_ptr,
+    slot_mapping_ptr,
+    KV_CACHE_BLOCK_SIZE: tl.constexpr,
+    BLOCKS_PER_KV_BLOCK: tl.constexpr,
+    LOGICAL_BLOCK_SIZE: tl.constexpr,
+):
+    """Map a single decode token without launching the generic pad program."""
+    position = tl.load(positions_ptr)
+    physical_block_idx = position // KV_CACHE_BLOCK_SIZE
+    physical_block_offset = position - physical_block_idx * KV_CACHE_BLOCK_SIZE
+    logical_block_idx = (
+        physical_block_idx * BLOCKS_PER_KV_BLOCK
+        + physical_block_offset // LOGICAL_BLOCK_SIZE
+    )
+    block_number = tl.load(block_table_ptr + logical_block_idx).to(tl.int64)
+    slot_offset = physical_block_offset % LOGICAL_BLOCK_SIZE
+    tl.store(slot_mapping_ptr, block_number * LOGICAL_BLOCK_SIZE + slot_offset)
 
 
 class BlockTable:
@@ -159,6 +183,21 @@ class BlockTable:
             )
             self._compute_pcp_dcp_slot_mapping(req_indices, positions)
         else:
+            # Decode-only B=1 is the dominant latency path for autoregressive
+            # serving. The upstream kernel launches a second Triton program to
+            # pad the entire max-token buffer and costs ~190 us on Ascend even
+            # though only one slot is consumed. Later attention preparation
+            # already fills any graph-padding slice, so map just the live token.
+            if num_reqs == 1 and num_tokens == 1:
+                _compute_single_token_slot_mapping_kernel[(1,)](
+                    positions,
+                    self.block_table.gpu,
+                    self.slot_mapping.gpu,
+                    KV_CACHE_BLOCK_SIZE=self.physical_block_size,
+                    BLOCKS_PER_KV_BLOCK=self.blocks_per_phys_block,
+                    LOGICAL_BLOCK_SIZE=self.block_size,
+                )
+                return
             kernel_kwargs = {
                 "TOTAL_CP_WORLD_SIZE": total_cp_world_size,
                 "TOTAL_CP_RANK": total_cp_rank,
