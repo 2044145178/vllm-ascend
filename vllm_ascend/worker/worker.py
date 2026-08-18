@@ -793,7 +793,14 @@ class NPUWorker(WorkerBase):
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:
             try:
-                bind_cpus(self.local_rank)
+                bind_cpus(
+                    self.local_rank,
+                    process_fraction=getattr(
+                        get_ascend_config(),
+                        "cpu_binding_process_fraction",
+                        None,
+                    ),
+                )
             except Exception as e:
                 logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
         # Reset the seed to ensure that the random state is not affected by

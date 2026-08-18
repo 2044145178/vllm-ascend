@@ -5,6 +5,7 @@ import platform
 import shutil
 import subprocess
 from collections import defaultdict
+from math import ceil, floor
 
 import psutil
 import regex as re
@@ -505,6 +506,33 @@ class CpuAlloc:
         # Migrate memory once for the whole process, after all threads are pinned.
         self.bind_memory(main_pid, current_npu)
 
+    def bind_process_fraction(self, fraction: tuple[float, float]) -> None:
+        """Restrict every process thread to a relative slice of its main pool.
+
+        Multiple engines sharing one NPU otherwise receive the same CPU pool
+        and contend on every decode step.  Fractions make disjoint per-engine
+        pools portable across machines with different logical CPU numbering.
+        """
+        current_npu = self.device_info.running_npu_list[self.rank_id]
+        cpus = self.assign_main[current_npu]
+        start = floor(len(cpus) * fraction[0])
+        end = ceil(len(cpus) * fraction[1])
+        selected = cpus[start:end]
+        if not selected:
+            raise ValueError(
+                "cpu_binding_process_fraction selects no CPUs: "
+                f"fraction={fraction}, available={cpus}"
+            )
+        process = psutil.Process()
+        for thread in process.threads():
+            os.sched_setaffinity(thread.id, selected)
+        logger.info(
+            "[cpu_bind_partition] fraction=%s CPUs=%s threads=%d",
+            fraction,
+            selected,
+            len(process.threads()),
+        )
+
     def bind_npu_irq(self) -> None:
         if not self._reserve_irq_cpus():
             logger.info("[irq] IRQ binding skipped on Ascend 950.")
@@ -603,9 +631,14 @@ class CpuAlloc:
         self.bind_npu_irq()
 
 
-def bind_cpus(rank_id: int) -> None:
+def bind_cpus(
+    rank_id: int,
+    process_fraction: tuple[float, float] | None = None,
+) -> None:
     if not is_arm_cpu():
         logger.info("CPU binding skipped: non-ARM CPU detected.")
         return
     binder = CpuAlloc(rank_id)
     binder.run_all()
+    if process_fraction is not None:
+        binder.bind_process_fraction(process_fraction)

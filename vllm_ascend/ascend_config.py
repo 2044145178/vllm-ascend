@@ -163,6 +163,22 @@ class AscendConfig:
             additional_config.get("short_request_first_config", {})
         )
         self.enable_cpu_binding = additional_config.get("enable_cpu_binding", True)
+        cpu_binding_fraction = additional_config.get("cpu_binding_process_fraction")
+        if cpu_binding_fraction is None:
+            self.cpu_binding_process_fraction = None
+        else:
+            if not isinstance(cpu_binding_fraction, (list, tuple)) or len(cpu_binding_fraction) != 2:
+                raise ValueError(
+                    "cpu_binding_process_fraction must be a two-element list "
+                    "[start, end]"
+                )
+            start, end = (float(value) for value in cpu_binding_fraction)
+            if not 0.0 <= start < end <= 1.0:
+                raise ValueError(
+                    "cpu_binding_process_fraction must satisfy "
+                    f"0 <= start < end <= 1, got [{start}, {end}]"
+                )
+            self.cpu_binding_process_fraction = (start, end)
         self.enable_sleep_mode_extra_cleanup = additional_config.get("enable_sleep_mode_extra_cleanup", False)
         self.multistream_dsv4_dsa_overlap = additional_config.get("multistream_dsv4_dsa_overlap", True)
         self.enable_prefill_mc2 = bool(additional_config.get("enable_prefill_mc2", False))
