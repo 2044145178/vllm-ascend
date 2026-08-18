@@ -110,7 +110,11 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         self.mock_vllm_config.scheduler_config.chunked_prefill_enabled = False
         self.mock_device = "cpu:0"
         torch.Tensor.pin_memory = lambda x: x  # noqa
-        self.builder = AscendAttentionMetadataBuilder(None, None, self.mock_vllm_config, self.mock_device)
+        with patch(
+            "vllm_ascend.attention.attention_v1.get_ascend_config",
+            return_value=SimpleNamespace(decode_fia_static_kv_len=0),
+        ):
+            self.builder = AscendAttentionMetadataBuilder(None, None, self.mock_vllm_config, self.mock_device)
 
     def test_reorder_batch(self):
         mock_input_batch = MagicMock()
@@ -168,6 +172,37 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         mock_model = MagicMock()
 
         self.builder.build(1, common_attn_metadata, mock_model)
+
+    def test_build_static_decode_fia_pads_kv_and_masks_suffix(self):
+        self.builder.static_decode_fia_kv_len = 512
+        self.builder._static_decode_fia_mask = torch.empty((1, 1, 1, 512), dtype=torch.bool)
+        self.builder._static_decode_fia_mask_cpu = torch.empty_like(self.builder._static_decode_fia_mask)
+        self.builder.attn_mask_builder.get_attention_mask = MagicMock(return_value=None)
+        common_attn_metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1]),
+            query_start_loc_cpu=torch.tensor([0, 1]),
+            seq_lens_cpu=torch.tensor([302]),
+            num_reqs=1,
+            num_actual_tokens=1,
+            max_query_len=1,
+            decode_token_per_req=torch.tensor([1]),
+            block_table_tensor=torch.zeros((1, 8), dtype=torch.int32),
+            slot_mapping=torch.tensor([301]),
+            actual_seq_lengths_q=torch.tensor([1]),
+            positions=torch.tensor([301]),
+            attn_state=AscendAttentionState.DecodeOnly,
+            num_computed_tokens_cpu=None,
+            seq_lens=None,
+            max_seq_len=302,
+        )
+
+        metadata = self.builder.build(0, common_attn_metadata)
+
+        self.assertTrue(metadata.static_decode_fia)
+        self.assertEqual(metadata.seq_lens_list, [512])
+        self.assertEqual(metadata.seq_lens.tolist(), [512])
+        self.assertFalse(metadata.attn_mask[..., :302].any())
+        self.assertTrue(metadata.attn_mask[..., 302:].all())
 
 
 class TestAscendAttentionBackendImpl(TestBase):
@@ -288,6 +323,26 @@ class TestAscendAttentionBackendImpl(TestBase):
             attn_type=self.attention_type.DECODER,
             kv_sharing_target_layer_name=None,
         )
+
+    def test_static_decode_fia_truncates_block_table_to_fixed_kv(self):
+        self.impl.key_cache = torch.zeros(16, 128, 8, 64)
+        self.impl.value_cache = torch.zeros_like(self.impl.key_cache)
+        metadata = SimpleNamespace(
+            attn_state=AscendAttentionState.DecodeOnly,
+            block_tables=torch.arange(32, dtype=torch.int32).reshape(1, 32),
+            seq_lens_list=[512],
+            static_decode_fia=True,
+        )
+
+        _, _, block_size, block_table, seq_lens = self.impl._get_fia_params(
+            torch.empty(1, 8, 64),
+            torch.empty(1, 8, 64),
+            metadata,
+        )
+
+        self.assertEqual(block_size, 128)
+        self.assertEqual(block_table.shape, (1, 4))
+        self.assertEqual(seq_lens, [512])
 
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
     def test_large_head_prefill_uses_device_operator_fallback(self, mock_get_forward_context):
