@@ -642,3 +642,34 @@ def bind_cpus(
     binder.run_all()
     if process_fraction is not None:
         binder.bind_process_fraction(process_fraction)
+
+
+def bind_process_fraction_from_current_affinity(fraction: tuple[float, float]) -> list[int]:
+    """Partition the process's inherited CPU set without NPU topology tools.
+
+    Minimal challenge images can expose a working NPU runtime without shipping
+    the ``npu-smi`` executable used by :class:`CpuAlloc`. In that environment,
+    preserve the important cross-engine isolation by slicing the container's
+    current cpuset. NUMA-local topology binding remains preferred whenever the
+    normal allocator succeeds.
+    """
+    cpus = sorted(os.sched_getaffinity(0))
+    start = floor(len(cpus) * fraction[0])
+    end = ceil(len(cpus) * fraction[1])
+    selected = cpus[start:end]
+    if not selected:
+        raise ValueError(
+            "cpu_binding_process_fraction selects no inherited CPUs: "
+            f"fraction={fraction}, available={cpus}"
+        )
+    process = psutil.Process()
+    threads = process.threads()
+    for thread in threads:
+        os.sched_setaffinity(thread.id, selected)
+    logger.info(
+        "[cpu_bind_partition_fallback] fraction=%s CPUs=%s threads=%d",
+        fraction,
+        selected,
+        len(threads),
+    )
+    return selected

@@ -58,7 +58,7 @@ from vllm.v1.worker.workspace import init_workspace_manager
 import vllm_ascend.envs as envs_ascend
 from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 from vllm_ascend.batch_invariant import init_batch_invariance
-from vllm_ascend.cpu_binding import bind_cpus
+from vllm_ascend.cpu_binding import bind_cpus, bind_process_fraction_from_current_affinity
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
@@ -792,17 +792,35 @@ class NPUWorker(WorkerBase):
         # Bind after warmup so hot allocations are already materialized on the
         # worker process before migratepages/taskset run.
         if get_ascend_config().enable_cpu_binding:
+            process_fraction = getattr(
+                get_ascend_config(),
+                "cpu_binding_process_fraction",
+                None,
+            )
             try:
                 bind_cpus(
                     self.local_rank,
-                    process_fraction=getattr(
-                        get_ascend_config(),
-                        "cpu_binding_process_fraction",
-                        None,
-                    ),
+                    process_fraction=process_fraction,
                 )
             except Exception as e:
-                logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+                if process_fraction is None:
+                    logger.warning("Bind cpus failed in rank%s: %s Skip binding cpu.", self.local_rank, e)
+                else:
+                    try:
+                        bind_process_fraction_from_current_affinity(process_fraction)
+                        logger.warning(
+                            "Topology-aware CPU binding failed in rank%s: %s; "
+                            "applied inherited-cpuset fraction fallback.",
+                            self.local_rank,
+                            e,
+                        )
+                    except Exception as fallback_error:
+                        logger.warning(
+                            "Bind cpus failed in rank%s: %s; fraction fallback failed: %s. Skip binding cpu.",
+                            self.local_rank,
+                            e,
+                            fallback_error,
+                        )
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
