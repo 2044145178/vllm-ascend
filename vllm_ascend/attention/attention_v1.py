@@ -265,6 +265,19 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         self._static_decode_fia_mask: torch.Tensor | None = None
         self._static_decode_fia_mask_cpu: torch.Tensor | None = None
         self._static_decode_fia_last_len = -1
+        additional_config = getattr(vllm_config, "additional_config", None)
+        stage1_speculative = (
+            additional_config.get("stage1_speculative", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
+        self._stage1_dspark_static_fia_enabled = (
+            isinstance(stage1_speculative, dict)
+            and bool(stage1_speculative.get("enabled", False))
+        )
+        self._static_decode_fia_block_masks: dict[int, torch.Tensor] = {}
+        self._static_decode_fia_block_masks_cpu: dict[int, torch.Tensor] = {}
+        self._static_decode_fia_block_last_len: dict[int, int] = {}
         if self.static_decode_fia_kv_len:
             cache_capacity = self.max_num_blocks_per_req * AscendAttentionBackend.get_supported_kernel_block_sizes()[0]
             if self.static_decode_fia_kv_len > cache_capacity:
@@ -342,14 +355,38 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
         seq_lens_list = seq_lens.tolist()
         static_decode_fia = False
-        if (
+        scalar_static_decode = (
             self.static_decode_fia_kv_len
             and attn_state == AscendAttentionState.DecodeOnly
             and num_reqs == 1
             and num_actual_tokens == 1
             and common_attn_metadata.causal
             and seq_lens_list[0] <= self.static_decode_fia_kv_len
-        ):
+        )
+        is_prefilling = common_attn_metadata.is_prefilling
+        has_prefill_request = bool(
+            is_prefilling is not None
+            and torch.any(is_prefilling[:num_reqs]).item()
+        )
+        stage1_block_static_decode = (
+            self.static_decode_fia_kv_len
+            and self._stage1_dspark_static_fia_enabled
+            and attn_state
+            in (
+                AscendAttentionState.DecodeOnly,
+                AscendAttentionState.SpecDecoding,
+                AscendAttentionState.ChunkedPrefill,
+            )
+            and num_reqs == 1
+            and 1 < num_actual_tokens <= self.decode_threshold
+            # Ascend exposes non-MTP speculative decode to attention backends as
+            # ChunkedPrefill.  Keep genuine short prompt chunks on the normal
+            # prefill path even when they happen to have the same query length.
+            and not has_prefill_request
+            and common_attn_metadata.causal
+            and num_actual_tokens <= seq_lens_list[0] <= self.static_decode_fia_kv_len
+        )
+        if scalar_static_decode:
             actual_kv_len = seq_lens_list[0]
             if actual_kv_len != self._static_decode_fia_last_len:
                 assert self._static_decode_fia_mask is not None
@@ -362,6 +399,28 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
                 )
                 self._static_decode_fia_last_len = actual_kv_len
             attn_mask = self._static_decode_fia_mask
+            seq_lens_list = [self.static_decode_fia_kv_len]
+            seq_lens = seq_lens.new_full((1,), self.static_decode_fia_kv_len)
+            static_decode_fia = True
+        elif stage1_block_static_decode:
+            actual_kv_len = seq_lens_list[0]
+            query_len = num_actual_tokens
+            mask = self._static_decode_fia_block_masks.get(query_len)
+            mask_cpu = self._static_decode_fia_block_masks_cpu.get(query_len)
+            if mask is None or mask_cpu is None:
+                mask_shape = (1, 1, query_len, self.static_decode_fia_kv_len)
+                mask = torch.empty(mask_shape, dtype=torch.bool, device=self.device)
+                mask_cpu = torch.empty(mask_shape, dtype=torch.bool, pin_memory=True)
+                self._static_decode_fia_block_masks[query_len] = mask
+                self._static_decode_fia_block_masks_cpu[query_len] = mask_cpu
+            if actual_kv_len != self._static_decode_fia_block_last_len.get(query_len):
+                prefix_len = actual_kv_len - query_len
+                mask_cpu.fill_(True)
+                for query_index in range(query_len):
+                    mask_cpu[..., query_index, : prefix_len + query_index + 1].fill_(False)
+                mask.copy_(mask_cpu, non_blocking=True)
+                self._static_decode_fia_block_last_len[query_len] = actual_kv_len
+            attn_mask = mask
             seq_lens_list = [self.static_decode_fia_kv_len]
             seq_lens = seq_lens.new_full((1,), self.static_decode_fia_kv_len)
             static_decode_fia = True

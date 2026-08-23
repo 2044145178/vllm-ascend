@@ -203,6 +203,122 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         self.assertEqual(metadata.seq_lens.tolist(), [512])
         self.assertFalse(metadata.attn_mask[..., :302].any())
         self.assertTrue(metadata.attn_mask[..., 302:].all())
+        self.assertEqual(self.builder._static_decode_fia_block_masks, {})
+
+    def _stage1_block_common_metadata(
+        self,
+        *,
+        query_len: int = 9,
+        seq_len: int = 228,
+        attn_state: AscendAttentionState = AscendAttentionState.SpecDecoding,
+        is_prefilling: bool = False,
+    ) -> AscendCommonAttentionMetadata:
+        prefix_len = seq_len - query_len
+        return AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, query_len]),
+            query_start_loc_cpu=torch.tensor([0, query_len]),
+            seq_lens_cpu=torch.tensor([seq_len]),
+            num_reqs=1,
+            num_actual_tokens=query_len,
+            max_query_len=query_len,
+            decode_token_per_req=torch.tensor([query_len]),
+            block_table_tensor=torch.zeros((1, 8), dtype=torch.int32),
+            slot_mapping=torch.arange(prefix_len, seq_len),
+            actual_seq_lengths_q=torch.tensor([query_len]),
+            positions=torch.arange(prefix_len, seq_len),
+            attn_state=attn_state,
+            num_computed_tokens_cpu=None,
+            seq_lens=None,
+            max_seq_len=seq_len,
+            causal=True,
+            is_prefilling=torch.tensor([is_prefilling]),
+        )
+
+    def test_build_stage1_block_static_fia_has_per_query_causal_mask(self):
+        query_len = 9
+        seq_len = 228
+        prefix_len = seq_len - query_len
+        self.builder.static_decode_fia_kv_len = 512
+        self.builder.decode_threshold = query_len
+        self.builder._stage1_dspark_static_fia_enabled = True
+        block_mask = torch.empty((1, 1, query_len, 512), dtype=torch.bool)
+        self.builder._static_decode_fia_block_masks[query_len] = block_mask
+        self.builder._static_decode_fia_block_masks_cpu[query_len] = torch.empty_like(
+            block_mask
+        )
+        self.builder.attn_mask_builder.get_attention_mask = MagicMock(return_value=None)
+
+        metadata = self.builder.build(
+            0,
+            self._stage1_block_common_metadata(
+                query_len=query_len,
+                seq_len=seq_len,
+            ),
+        )
+
+        self.assertTrue(metadata.static_decode_fia)
+        self.assertEqual(metadata.seq_lens_list, [512])
+        self.assertEqual(metadata.seq_lens.tolist(), [512])
+        self.assertEqual(metadata.attn_mask.shape, (1, 1, query_len, 512))
+        for query_index in range(query_len):
+            allowed = prefix_len + query_index + 1
+            self.assertFalse(metadata.attn_mask[..., query_index, :allowed].any())
+            self.assertTrue(metadata.attn_mask[..., query_index, allowed:].all())
+
+    def test_build_stage1_block_static_fia_accepts_chunked_prefill_state(self):
+        query_len = 9
+        self.builder.static_decode_fia_kv_len = 512
+        self.builder.decode_threshold = query_len
+        self.builder._stage1_dspark_static_fia_enabled = True
+        block_mask = torch.empty((1, 1, query_len, 512), dtype=torch.bool)
+        self.builder._static_decode_fia_block_masks[query_len] = block_mask
+        self.builder._static_decode_fia_block_masks_cpu[query_len] = torch.empty_like(
+            block_mask
+        )
+        self.builder.attn_mask_builder.get_attention_mask = MagicMock(return_value=None)
+
+        metadata = self.builder.build(
+            0,
+            self._stage1_block_common_metadata(
+                query_len=query_len,
+                attn_state=AscendAttentionState.ChunkedPrefill,
+            ),
+        )
+
+        self.assertTrue(metadata.static_decode_fia)
+
+    def test_build_stage1_block_static_fia_is_gated_and_overflow_safe(self):
+        query_len = 9
+        self.builder.static_decode_fia_kv_len = 512
+        self.builder.decode_threshold = query_len
+        self.builder.attn_mask_builder.get_attention_mask = MagicMock(return_value=None)
+
+        self.builder._stage1_dspark_static_fia_enabled = False
+        nongated = self.builder.build(
+            0,
+            self._stage1_block_common_metadata(query_len=query_len),
+        )
+        self.assertFalse(nongated.static_decode_fia)
+
+        self.builder._stage1_dspark_static_fia_enabled = True
+        overflow = self.builder.build(
+            0,
+            self._stage1_block_common_metadata(
+                query_len=query_len,
+                seq_len=513,
+            ),
+        )
+        self.assertFalse(overflow.static_decode_fia)
+
+        short_prompt = self.builder.build(
+            0,
+            self._stage1_block_common_metadata(
+                query_len=query_len,
+                attn_state=AscendAttentionState.ChunkedPrefill,
+                is_prefilling=True,
+            ),
+        )
+        self.assertFalse(short_prompt.static_decode_fia)
 
 
 class TestAscendAttentionBackendImpl(TestBase):
